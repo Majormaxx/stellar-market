@@ -1,7 +1,7 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contractimpl, contracttype, contracterror, symbol_short, Address, Env, String, Vec,
+    contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, String, Vec,
 };
 use stellar_market_escrow::{EscrowContractClient, JobStatus};
 
@@ -40,26 +40,49 @@ pub struct UserReputation {
 }
 
 #[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum ReputationTier {
+    None = 0,
+    Bronze = 1,
+    Silver = 2,
+    Gold = 3,
+    Platinum = 4,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Badge {
+    pub badge_type: ReputationTier,
+    pub awarded_at: u64,
+}
+
+#[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum DataKey {
     Reputation(Address),
     Reviews(Address),
     ReviewExists(Address, Address, u64),
+    Badges(Address),
 }
 
 const MIN_TTL_THRESHOLD: u32 = 1_000;
 const MIN_TTL_EXTEND_TO: u32 = 10_000;
 
 fn bump_reputation_ttl(env: &Env, user: &Address) {
-    env.storage()
-        .persistent()
-        .extend_ttl(&DataKey::Reputation(user.clone()), MIN_TTL_THRESHOLD, MIN_TTL_EXTEND_TO);
+    env.storage().persistent().extend_ttl(
+        &DataKey::Reputation(user.clone()),
+        MIN_TTL_THRESHOLD,
+        MIN_TTL_EXTEND_TO,
+    );
 }
 
 fn bump_reviews_ttl(env: &Env, user: &Address) {
-    env.storage()
-        .persistent()
-        .extend_ttl(&DataKey::Reviews(user.clone()), MIN_TTL_THRESHOLD, MIN_TTL_EXTEND_TO);
+    env.storage().persistent().extend_ttl(
+        &DataKey::Reviews(user.clone()),
+        MIN_TTL_THRESHOLD,
+        MIN_TTL_EXTEND_TO,
+    );
 }
 
 fn bump_review_exists_ttl(env: &Env, reviewer: &Address, reviewee: &Address, job_id: u64) {
@@ -68,6 +91,35 @@ fn bump_review_exists_ttl(env: &Env, reviewer: &Address, reviewee: &Address, job
         MIN_TTL_THRESHOLD,
         MIN_TTL_EXTEND_TO,
     );
+}
+
+fn bump_badges_ttl(env: &Env, user: &Address) {
+    env.storage().persistent().extend_ttl(
+        &DataKey::Badges(user.clone()),
+        MIN_TTL_THRESHOLD,
+        MIN_TTL_EXTEND_TO,
+    );
+}
+
+/// Calculate the reputation tier based on average rating score.
+/// Score thresholds:
+/// - 0-99: None
+/// - 100-299: Bronze
+/// - 300-499: Silver
+/// - 500-699: Gold
+/// - 700+: Platinum
+fn calculate_tier(average_rating: u64) -> ReputationTier {
+    if average_rating >= 700 {
+        ReputationTier::Platinum
+    } else if average_rating >= 500 {
+        ReputationTier::Gold
+    } else if average_rating >= 300 {
+        ReputationTier::Silver
+    } else if average_rating >= 100 {
+        ReputationTier::Bronze
+    } else {
+        ReputationTier::None
+    }
 }
 
 #[contract]
@@ -131,16 +183,16 @@ impl ReputationContract {
 
         // Update user reputation
         let rep_key = DataKey::Reputation(reviewee.clone());
-        let mut reputation: UserReputation = env
-            .storage()
-            .persistent()
-            .get(&rep_key)
-            .unwrap_or(UserReputation {
-                user: reviewee.clone(),
-                total_score: 0,
-                total_weight: 0,
-                review_count: 0,
-            });
+        let mut reputation: UserReputation =
+            env.storage()
+                .persistent()
+                .get(&rep_key)
+                .unwrap_or(UserReputation {
+                    user: reviewee.clone(),
+                    total_score: 0,
+                    total_weight: 0,
+                    review_count: 0,
+                });
 
         reputation.total_score += (rating as u64) * weight;
         reputation.total_weight += weight;
@@ -173,6 +225,37 @@ impl ReputationContract {
         // Mark as reviewed
         env.storage().persistent().set(&review_key, &true);
         bump_review_exists_ttl(&env, &reviewer, &reviewee, job_id);
+
+        // Check for tier upgrade and award badge if necessary
+        let new_avg_rating = (reputation.total_score * 100) / reputation.total_weight;
+        let new_tier = calculate_tier(new_avg_rating);
+        
+        // Get existing badges to check if this tier badge already exists
+        let badges_key = DataKey::Badges(reviewee.clone());
+        let mut badges: Vec<Badge> = env
+            .storage()
+            .persistent()
+            .get(&badges_key)
+            .unwrap_or(Vec::new(&env));
+        
+        // Check if user already has this tier badge
+        let has_tier_badge = badges.iter().any(|b| b.badge_type == new_tier);
+        
+        if !has_tier_badge && new_tier != ReputationTier::None {
+            let badge = Badge {
+                badge_type: new_tier.clone(),
+                awarded_at: env.ledger().timestamp(),
+            };
+            badges.push_back(badge);
+            env.storage().persistent().set(&badges_key, &badges);
+            bump_badges_ttl(&env, &reviewee);
+            
+            // Emit badge awarded event
+            env.events().publish(
+                (symbol_short!("reput"), symbol_short!("badge")),
+                (reviewee.clone(), new_tier),
+            );
+        }
 
         // Emit event
         env.events().publish(
@@ -224,9 +307,36 @@ impl ReputationContract {
         let reviews: Option<Vec<Review>> = env.storage().persistent().get(&reviews_key);
         match reviews {
             Some(list) => {
-                env.storage()
-                    .persistent()
-                    .extend_ttl(&reviews_key, MIN_TTL_THRESHOLD, MIN_TTL_EXTEND_TO);
+                env.storage().persistent().extend_ttl(
+                    &reviews_key,
+                    MIN_TTL_THRESHOLD,
+                    MIN_TTL_EXTEND_TO,
+                );
+                list
+            }
+            None => Vec::new(&env),
+        }
+    }
+
+    /// Get the reputation tier for a user based on their average rating.
+    pub fn get_tier(env: Env, user: Address) -> ReputationTier {
+        match Self::get_average_rating(env, user) {
+            Ok(avg_rating) => calculate_tier(avg_rating),
+            Err(_) => ReputationTier::None,
+        }
+    }
+
+    /// Get all badges awarded to a user.
+    pub fn get_badges(env: Env, user: Address) -> Vec<Badge> {
+        let badges_key = DataKey::Badges(user);
+        let badges: Option<Vec<Badge>> = env.storage().persistent().get(&badges_key);
+        match badges {
+            Some(list) => {
+                env.storage().persistent().extend_ttl(
+                    &badges_key,
+                    MIN_TTL_THRESHOLD,
+                    MIN_TTL_EXTEND_TO,
+                );
                 list
             }
             None => Vec::new(&env),
